@@ -8,12 +8,13 @@ const router = Router()
 export default (app: Router) => {
   app.use('/admin', router)
 
+  /** Download lần lượt tất cả phim type=movie theo id, sau đó upload lên S3. Query: onlyNotUploaded=false để xử lý cả phim đã có s3Url */
+  app.get('/admin/download-movies', downloadMoviesSequentialController)
+  
   app.get('/admin/:id', crawlMovieController)
 
   app.get('/admin/download/:id', downloadMovieController)
 
-  /** Download lần lượt tất cả phim type=movie theo id, sau đó upload lên S3. Query: onlyNotUploaded=false để xử lý cả phim đã có s3Url */
-  app.get('/admin/download-movies', downloadMoviesSequentialController)
 
   return router
 }
