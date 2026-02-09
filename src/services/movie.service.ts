@@ -1,8 +1,12 @@
 import { dataSource } from "@/data-source"
 import { Movie } from "@/entities/movie"
+import { MovieType } from "@/entities/movie"
+import { appConfig } from "@/configs/app-config"
 import axios from "axios"
-import { writeFile, mkdir } from 'node:fs/promises'
-import { spawn, } from 'cross-spawn'
+import { writeFile, mkdir, readFile, readdir } from 'node:fs/promises'
+import { spawn } from 'cross-spawn'
+import path from 'node:path'
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
 
 export class MovieService {
   async crawlMovie(id: number): Promise<Movie> {
@@ -76,7 +80,7 @@ export class MovieService {
     });
   }
 
-  downloadSubtitle = async (titleId: number) => {
+  downloadSubtitle = async (titleId: number, targetDir: string) => {
     const subtitleInfo = await axios.post("https://phimpal.com/b/g", {
       "variables": { "titleId": `${titleId}` },
       "query":
@@ -91,13 +95,14 @@ export class MovieService {
     let res: any = "";
     try {
       res = await axios.get(subtitleUrl);
-      writeFile(`${titleId}.srt`, res.data);
+      await writeFile(path.join(targetDir, `${titleId}.srt`), res.data);
     } catch (error) {
       console.log("Cant get subtitle", subtitleUrl);
     }
   };
 
-  async downloadMovie(id: number) {
+  /** Download movie to disk, returns absolute path of the .ts file */
+  async downloadMovie(id: number): Promise<string | null> {
     const movie = await axios
       .post("https://phimpal.com/b/g", {
         "variables": {
@@ -107,25 +112,132 @@ export class MovieService {
           "query TitleWatch($id: String) {title(id: $id) {id nameEn srcUrl}}",
       })
       .then((res) => res.data.data.title);
-    const { srcUrl, nameEn, id: movieId } = movie;
+    if (!movie?.srcUrl) return null;
 
-    const folderName = `downloaded/${nameEn ? `${movieId} - ${nameEn}` : movieId}`;
-    await mkdir(folderName, { recursive: true });
-    process.chdir(folderName);
-    await this.downloadSubtitle(id);
+    const { srcUrl, nameEn, id: movieId } = movie;
+    const folderName = nameEn ? `${movieId} - ${nameEn}` : String(movieId);
+    const baseDir = path.resolve(process.cwd(), 'downloaded', folderName);
+    await mkdir(baseDir, { recursive: true });
+
+    await this.downloadSubtitle(id, baseDir);
+
+    const outputFileName = nameEn ? `${movieId} - ${nameEn}.ts` : `${movieId}.ts`;
+    const hlsdlPath = path.resolve(process.cwd(), 'downloaded', 'hlsdl');
 
     await this.spawnAsync(
-      "../hlsdl",
-      [
-        "-b",
-        "-f",
-        "-o",
-        `${nameEn ? `${movieId} - ${nameEn}` : movieId}.ts`,
-        `${srcUrl}`,
-      ],
-      {
-        stdio: "inherit",
-      }
+      hlsdlPath,
+      ["-b", "-f", "-o", outputFileName, srcUrl],
+      { stdio: "inherit", cwd: baseDir }
     );
+
+    return path.join(baseDir, outputFileName);
+  }
+
+  /** Get movies with type=movie from DB, order by id (optional: only not yet uploaded) */
+  async getMoviesToProcess(onlyNotUploaded = true): Promise<Movie[]> {
+    const repo = dataSource.getRepository(Movie);
+    const qb = repo
+      .createQueryBuilder('m')
+      .where('m.type = :type', { type: MovieType.MOVIE })
+      .orderBy('m.id', 'ASC');
+    if (onlyNotUploaded) {
+      qb.andWhere('(m.s3Url IS NULL OR m.s3Url = :empty)', { empty: '' });
+    }
+    return qb.getMany();
+  }
+
+  private buildS3Url(s3Key: string): string {
+    const { region, bucket, endpoint } = appConfig.s3;
+    const useCustomEndpoint = endpoint && !endpoint.includes('amazonaws.com');
+    if (useCustomEndpoint) {
+      return `${endpoint!.replace(/\/$/, '')}/${bucket}/${s3Key}`;
+    }
+    return `https://${bucket}.s3.${region}.amazonaws.com/${s3Key}`;
+  }
+
+  /** Upload một file lên S3 */
+  async uploadFileToS3(localFilePath: string, s3Key: string, contentType?: string): Promise<void> {
+    const { region, bucket, endpoint, accessKeyId, secretAccessKey } = appConfig.s3;
+    if (!bucket) {
+      throw new Error('S3 config missing: AWS_S3_BUCKET');
+    }
+    const useCustomEndpoint = endpoint && !endpoint.includes('amazonaws.com');
+    const client = new S3Client({
+      region: region || 'ap-southeast-1',
+      ...(useCustomEndpoint && { endpoint }),
+      ...(accessKeyId && secretAccessKey && { credentials: { accessKeyId, secretAccessKey } }),
+    });
+    const body = await readFile(localFilePath);
+    const ext = path.extname(localFilePath).toLowerCase();
+    const contentTypes: Record<string, string> = {
+      '.ts': 'video/mp2t',
+      '.srt': 'application/x-subrip',
+      '.vtt': 'text/vtt',
+    };
+    await client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: s3Key,
+        Body: body,
+        ContentType: contentType ?? contentTypes[ext] ?? 'application/octet-stream',
+      })
+    );
+  }
+
+  /** Upload toàn bộ thư mục lên S3 (prefix dạng movies/123/). Trả về URL file .ts chính (dùng cho s3Url). */
+  async uploadFolderToS3(localFolderPath: string, s3Prefix: string): Promise<string> {
+    const entries = await readdir(localFolderPath, { withFileTypes: true });
+    let mainTsUrl = '';
+    const prefix = s3Prefix.endsWith('/') ? s3Prefix : s3Prefix + '/';
+
+    for (const entry of entries) {
+      const fullPath = path.join(localFolderPath, entry.name);
+      const relativePath = path.relative(localFolderPath, fullPath).split(path.sep).join('/');
+      const s3Key = prefix + relativePath;
+
+      if (entry.isFile()) {
+        await this.uploadFileToS3(fullPath, s3Key);
+        if (entry.name.endsWith('.ts')) mainTsUrl = this.buildS3Url(s3Key);
+      } else if (entry.isDirectory()) {
+        const subUrl = await this.uploadFolderToS3(fullPath, prefix + relativePath + '/');
+        if (subUrl) mainTsUrl = mainTsUrl || subUrl;
+      }
+    }
+    return mainTsUrl;
+  }
+
+  /** Download one movie then upload cả folder lên S3 và update DB */
+  async downloadAndUploadMovie(id: number): Promise<{ id: number; s3Url?: string; error?: string }> {
+    const repo = dataSource.getRepository(Movie);
+    const movie = await repo.findOneBy({ id });
+    if (!movie) return { id, error: 'Movie not found' };
+
+    const localFilePath = await this.downloadMovie(id);
+    if (!localFilePath) return { id, error: 'Download failed or no srcUrl' };
+
+    const folderPath = path.dirname(localFilePath);
+    const s3Prefix = `movies/${id}`;
+    const s3Url = await this.uploadFolderToS3(folderPath, s3Prefix);
+
+    await repo.update(
+      { id },
+      { s3Url: s3Url || undefined, downloadedAt: new Date() }
+    );
+    return { id, s3Url: s3Url || undefined };
+  }
+
+  /** Download and upload all type=movie films in order by id */
+  async downloadAndUploadMoviesSequentially(onlyNotUploaded = true): Promise<{ processed: number; results: { id: number; s3Url?: string; error?: string }[] }> {
+    const movies = await this.getMoviesToProcess(onlyNotUploaded);
+    const results: { id: number; s3Url?: string; error?: string }[] = [];
+    for (const movie of movies) {
+      try {
+        const result = await this.downloadAndUploadMovie(movie.id);
+        results.push(result);
+      } catch (err) {
+        results.push({ id: movie.id, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return { processed: movies.length, results };
   }
 }
