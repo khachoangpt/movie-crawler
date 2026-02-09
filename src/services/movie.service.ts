@@ -2,6 +2,7 @@ import { dataSource } from "@/data-source"
 import { Movie } from "@/entities/movie"
 import { MovieType } from "@/entities/movie"
 import { appConfig } from "@/configs/app-config"
+import { logger } from "@/configs/logger"
 import axios from "axios"
 import { writeFile, mkdir, readFile, readdir } from 'node:fs/promises'
 import { spawn } from 'cross-spawn'
@@ -97,39 +98,76 @@ export class MovieService {
       res = await axios.get(subtitleUrl);
       await writeFile(path.join(targetDir, `${titleId}.srt`), res.data);
     } catch (error) {
-      console.log("Cant get subtitle", subtitleUrl);
+      logger.warn(`[downloadSubtitle] titleId=${titleId} – Không tải được subtitle`, {
+        subtitleUrl,
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
   };
 
   /** Download movie to disk, returns absolute path of the .ts file */
   async downloadMovie(id: number): Promise<string | null> {
-    const movie = await axios
-      .post("https://phimpal.com/b/g", {
-        "variables": {
-          "id": `${id}`,
-        },
+    let movie: { id: number; nameEn?: string; srcUrl?: string } | undefined;
+    try {
+      const res = await axios.post("https://phimpal.com/b/g", {
+        "variables": { "id": `${id}` },
         "query":
           "query TitleWatch($id: String) {title(id: $id) {id nameEn srcUrl}}",
-      })
-      .then((res) => res.data.data.title);
-    if (!movie?.srcUrl) return null;
+      });
+      movie = res.data?.data?.title;
+    } catch (err) {
+      logger.error(`[downloadMovie] id=${id} – Gọi API phimpal thất bại`, {
+        message: err instanceof Error ? err.message : String(err),
+        response: axios.isAxiosError(err) ? { status: err.response?.status, data: err.response?.data } : undefined,
+      });
+      return null;
+    }
+
+    if (!movie) {
+      logger.warn(`[downloadMovie] id=${id} – API không trả về title (data.title null/undefined)`);
+      return null;
+    }
+    if (!movie.srcUrl) {
+      logger.warn(`[downloadMovie] id=${id} – Title không có srcUrl (nameEn: ${movie.nameEn ?? 'N/A'})`);
+      return null;
+    }
 
     const { srcUrl, nameEn, id: movieId } = movie;
     const folderName = nameEn ? `${movieId} - ${nameEn}` : String(movieId);
     const baseDir = path.resolve(process.cwd(), 'downloaded', folderName);
-    await mkdir(baseDir, { recursive: true });
 
-    await this.downloadSubtitle(id, baseDir);
+    try {
+      await mkdir(baseDir, { recursive: true });
+    } catch (err) {
+      logger.error(`[downloadMovie] id=${id} – Tạo thư mục thất bại: ${baseDir}`, {
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+
+    try {
+      await this.downloadSubtitle(id, baseDir);
+    } catch (err) {
+      logger.warn(`[downloadMovie] id=${id} – Tải subtitle thất bại (bỏ qua, tiếp tục tải video)`, {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     const outputFileName = nameEn ? `${movieId} - ${nameEn}.ts` : `${movieId}.ts`;
-    // const hlsdlPath = path.resolve(process.cwd(), 'downloaded', 'hlsdl');
     const hlsdlPath = 'hlsdl';
 
-    await this.spawnAsync(
-      hlsdlPath,
-      ["-b", "-f", "-o", outputFileName, srcUrl],
-      { stdio: "inherit", cwd: baseDir }
-    );
+    try {
+      await this.spawnAsync(
+        hlsdlPath,
+        ["-b", "-f", "-o", outputFileName, srcUrl],
+        { stdio: "inherit", cwd: baseDir }
+      );
+    } catch (err) {
+      logger.error(`[downloadMovie] id=${id} – hlsdl chạy thất bại (file: ${outputFileName}, cwd: ${baseDir})`, {
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
 
     return path.join(baseDir, outputFileName);
   }
