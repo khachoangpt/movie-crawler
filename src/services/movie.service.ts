@@ -114,7 +114,7 @@ export class MovieService {
         "query":
           "query TitleWatch($id: String) {title(id: $id) {id nameEn srcUrl}}",
       });
-      movie = res.data?.data?.title;
+      movie = res.data?.data
     } catch (err) {
       logger.error(`[downloadMovie] id=${id} – Gọi API phimpal thất bại`, {
         message: err instanceof Error ? err.message : String(err),
