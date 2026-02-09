@@ -122,7 +122,8 @@ export class MovieService {
     await this.downloadSubtitle(id, baseDir);
 
     const outputFileName = nameEn ? `${movieId} - ${nameEn}.ts` : `${movieId}.ts`;
-    const hlsdlPath = path.resolve(process.cwd(), 'downloaded', 'hlsdl');
+    // const hlsdlPath = path.resolve(process.cwd(), 'downloaded', 'hlsdl');
+    const hlsdlPath = 'hlsdl';
 
     await this.spawnAsync(
       hlsdlPath,
