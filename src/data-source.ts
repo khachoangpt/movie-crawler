@@ -10,4 +10,5 @@ export const dataSource = new DataSource({
     schema: 'public',
     entities: [path.join(__dirname, 'entities/*.{ts,js}')],
     migrations: [path.join(__dirname, 'migrations/*.{ts,js}')],
+    logging: ['query', 'error', 'schema'],
   })
